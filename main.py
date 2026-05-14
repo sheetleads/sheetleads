@@ -2,24 +2,26 @@ import os
 import json
 import time
 import random
+import logging
 import gspread
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, TimeoutError
+from playwright.sync_api import sync_playwright
 
-# --- НАСТРОЙКИ ---
-# Укажи точное название твоей таблицы и листа
-SPREADSHEET_NAME = "ТВОЯ_ТАБЛИЦА" 
-WORKSHEET_NAME = "Лист1"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Чтение настроек из переменных окружения
+SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME")
+WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Parsed_Leads")
 
 def get_gspread_client():
-    """Авторизация в Google Sheets через переменную окружения."""
+    """Авторизация в Google Sheets через JSON из переменной окружения."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_json:
-        raise ValueError("Переменная окружения GOOGLE_CREDENTIALS не найдена!")
+        raise ValueError("Переменная GOOGLE_CREDENTIALS не установлена!")
     
-    # Конвертируем строку из ENV в словарь
     creds_dict = json.loads(creds_json)
-    
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -28,82 +30,85 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 def scrape_category(page, url):
-    """Переходит по ссылке и парсит категорию бизнеса."""
-    # Переходим по ссылке, ждем загрузки страницы (таймаут 30 сек)
-    page.goto(url, timeout=30000)
-    page.wait_for_load_state("networkidle", timeout=10000)
-    
-    # Селектор для кнопки категории в Google Maps (обычно это кнопка с классом DkEaL)
-    # Если Google изменит дизайн, этот селектор нужно будет обновить
-    category_locator = page.locator('button.DkEaL').first
-    
-    # Ждем появления элемента максимум 5 секунд
-    category_locator.wait_for(state="visible", timeout=5000)
-    return category_locator.inner_text()
+    """Парсинг категории бизнеса через Playwright."""
+    try:
+        # Увеличиваем таймаут для медленных прокси/сетей
+        page.goto(url, timeout=60000, wait_until="networkidle")
+        
+        # Google Maps часто меняет классы, поэтому используем более общий селектор
+        # Обычно категория — это кнопка рядом с рейтингом
+        selector = 'button[jsaction*="pane.rating.category"]'
+        
+        # Ждем появления элемента
+        page.wait_for_selector(selector, timeout=10000)
+        category = page.locator(selector).first.inner_text()
+        return category.strip()
+    except Exception as e:
+        logger.warning(f"Не удалось спарсить {url}: {str(e)}")
+        return "Not Found"
 
 def main():
-    print("Подключение к Google Sheets...")
-    client = get_gspread_client()
-    sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
-    
-    print("Получение данных из таблицы...")
-    # Получаем все данные. Первая строка будет ключами словаря
-    records = sheet.get_all_records()
-    
-    # Получаем заголовки (1-я строка), чтобы вычислить индексы колонок
-    headers = sheet.row_values(1)
-    
-    if "Map Link" not in headers or "Category" not in headers:
-        print("Ошибка: Колонки 'Map Link' или 'Category' не найдены!")
+    if not SPREADSHEET_NAME:
+        logger.error("SPREADSHEET_NAME не задана!")
         return
 
-    # gspread использует индексы с 1, поэтому +1
-    category_col_index = headers.index("Category") + 1
+    logger.info(f"Запуск скрипта для таблицы: {SPREADSHEET_NAME}")
+    
+    client = get_gspread_client()
+    try:
+        spreadsheet = client.open(SPREADSHEET_NAME)
+        sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+    except Exception as e:
+        logger.error(f"Ошибка доступа к таблице: {e}")
+        return
 
-    print("Запуск браузера...")
+    # Получаем все данные одним запросом для экономии лимитов API
+    data = sheet.get_all_values()
+    if not data:
+        logger.info("Таблица пуста.")
+        return
+
+    headers = data[0]
+    try:
+        map_idx = headers.index("Map Link")
+        cat_idx = headers.index("Category")
+    except ValueError:
+        logger.error("Убедитесь, что в таблице есть колонки 'Map Link' и 'Category'!")
+        return
+
+    logger.info("Инициализация браузера...")
     with sync_playwright() as p:
-        # Запускаем Chromium в headless-режиме
         browser = p.chromium.launch(headless=True)
-        # Устанавливаем юзер-агент, чтобы быть похожими на реального пользователя
+        # Эмулируем реальный браузер
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            viewport={'width': 1280, 'height': 720},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         )
         page = context.new_page()
 
-        # Идем по строкам (со 2-й, так как 1-я - заголовки)
-        for i, row in enumerate(records, start=2):
-            map_link = row.get("Map Link", "").strip()
-            category = str(row.get("Category", "")).strip()
+        # Проходим по строкам (пропуская заголовок)
+        for i, row in enumerate(data[1:], start=2):
+            # Проверка, не заполнена ли уже категория
+            current_category = row[cat_idx] if len(row) > cat_idx else ""
+            map_url = row[map_idx] if len(row) > map_idx else ""
 
-            # Если есть ссылка, но категория пустая
-            if map_link and not category:
-                print(f"[Строка {i}] Обработка ссылки: {map_link}")
+            if map_url and not current_category:
+                logger.info(f"Обработка строки {i}: {map_url}")
                 
-                try:
-                    # Пытаемся получить категорию
-                    result_category = scrape_category(page, map_link)
-                    if not result_category:
-                        result_category = "Not Found"
-                except Exception as e:
-                    # Жесткий перехват любых ошибок (таймауты, битые ссылки)
-                    print(f"[Строка {i}] Ошибка парсинга: {type(e).__name__}")
-                    result_category = "Not Found"
+                category_result = scrape_category(page, map_url)
+                
+                # Мгновенное обновление ячейки (индексы в gspread с 1)
+                sheet.update_cell(i, cat_idx + 1, category_result)
+                logger.info(f"Результат: {category_result}")
 
-                # Мгновенная запись в Google Таблицу
-                try:
-                    sheet.update_cell(i, category_col_index, result_category)
-                    print(f"[Строка {i}] Записано: {result_category}")
-                except Exception as e:
-                    print(f"[Строка {i}] Ошибка записи в таблицу: {e}")
+                # Анти-фрод задержка
+                wait_time = random.randint(3, 6)
+                time.sleep(wait_time)
+            else:
+                logger.info(f"Строка {i} пропущена (уже заполнена или нет ссылки)")
 
-                # Случайная задержка от 3 до 6 секунд для защиты от бана
-                delay = random.randint(3, 6)
-                print(f"Ожидание {delay} сек...")
-                time.sleep(delay)
-
-        print("Процесс завершен. Закрытие браузера.")
         browser.close()
+    logger.info("Работа завершена!")
 
 if __name__ == "__main__":
     main()
-    
