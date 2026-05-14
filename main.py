@@ -30,23 +30,53 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 def scrape_category(page, url):
-    """Парсинг категории бизнеса через Playwright."""
+    """Парсинг категории бизнеса через Playwright с обходом защиты Google."""
     try:
-        # Увеличиваем таймаут для медленных прокси/сетей
-        page.goto(url, timeout=60000, wait_until="networkidle")
+        # domcontentloaded вместо networkidle, так как карты грузятся бесконечно
+        page.goto(url, timeout=45000, wait_until="domcontentloaded")
         
-        # Google Maps часто меняет классы, поэтому используем более общий селектор
-        # Обычно категория — это кнопка рядом с рейтингом
-        selector = 'button[jsaction*="pane.rating.category"]'
+        # Даем JS скриптам карт пару секунд на рендер интерфейса
+        page.wait_for_timeout(3000)
         
-        # Ждем появления элемента
-        page.wait_for_selector(selector, timeout=10000)
-        category = page.locator(selector).first.inner_text()
-        return category.strip()
-    except Exception as e:
-        logger.warning(f"Не удалось спарсить {url}: {str(e)}")
+        # 1. Попытка убить всплывающее окно Cookies (если оно появилось)
+        try:
+            # Ищем кнопки согласия на разных языках
+            cookie_btn = page.locator('button:has-text("Accept all"), button:has-text("Принять все"), button:has-text("Reject all")').first
+            # Ждем всего 2 секунды, если нет - значит окна нет
+            if cookie_btn.is_visible(timeout=2000):
+                cookie_btn.click()
+                page.wait_for_timeout(1500) # Ждем пока окно исчезнет
+        except Exception:
+            pass # Окна нет, идем дальше
+        
+        # 2. Несколько вариантов селекторов (Google часто меняет классы)
+        selectors = [
+            'button.DkEaL',  # Самый частый класс категории
+            'button[jsaction*="pane.rating.category"]', # Альтернативный
+            '.fontBodyMedium' # Широкий поиск по стилю текста
+        ]
+        
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                # Ждем появления элемента максимум 4 секунды
+                locator.wait_for(state="visible", timeout=4000)
+                
+                category_text = locator.inner_text().strip()
+                if category_text and len(category_text) > 2:
+                    # Google иногда ставит точку перед текстом, например "· Barber shop"
+                    return category_text.replace("·", "").strip()
+            except Exception:
+                # Если по этому селектору не нашли, пробуем следующий
+                continue
+                
+        # Если ни один селектор не сработал
+        logger.warning(f"Не найдены селекторы для: {url}")
         return "Not Found"
-
+        
+    except Exception as e:
+        logger.warning(f"Ошибка загрузки или таймаут {url}: {str(e)}")
+        return "Not Found"
 def main():
     if not SPREADSHEET_NAME:
         logger.error("SPREADSHEET_NAME не задана!")
