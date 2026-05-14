@@ -35,17 +35,15 @@ def scrape_category(page, url):
         # domcontentloaded вместо networkidle, так как карты грузятся бесконечно
         page.goto(url, timeout=45000, wait_until="domcontentloaded")
         
-        # Даем JS скриптам карт пару секунд на рендер интерфейса
+        # Даем JS скриптам карт время на рендер интерфейса
         page.wait_for_timeout(3000)
         
         # 1. Попытка убить всплывающее окно Cookies (если оно появилось)
         try:
-            # Ищем кнопки согласия на разных языках
             cookie_btn = page.locator('button:has-text("Accept all"), button:has-text("Принять все"), button:has-text("Reject all")').first
-            # Ждем всего 2 секунды, если нет - значит окна нет
             if cookie_btn.is_visible(timeout=2000):
                 cookie_btn.click()
-                page.wait_for_timeout(1500) # Ждем пока окно исчезнет
+                page.wait_for_timeout(1500)
         except Exception:
             pass # Окна нет, идем дальше
         
@@ -64,19 +62,18 @@ def scrape_category(page, url):
                 
                 category_text = locator.inner_text().strip()
                 if category_text and len(category_text) > 2:
-                    # Google иногда ставит точку перед текстом, например "· Barber shop"
+                    # Убираем точку, которую Google иногда ставит перед текстом
                     return category_text.replace("·", "").strip()
             except Exception:
-                # Если по этому селектору не нашли, пробуем следующий
                 continue
                 
-        # Если ни один селектор не сработал
         logger.warning(f"Не найдены селекторы для: {url}")
         return "Not Found"
         
     except Exception as e:
         logger.warning(f"Ошибка загрузки или таймаут {url}: {str(e)}")
         return "Not Found"
+
 def main():
     if not SPREADSHEET_NAME:
         logger.error("SPREADSHEET_NAME не задана!")
@@ -92,7 +89,6 @@ def main():
         logger.error(f"Ошибка доступа к таблице: {e}")
         return
 
-    # Получаем все данные одним запросом для экономии лимитов API
     data = sheet.get_all_values()
     if not data:
         logger.info("Таблица пуста.")
@@ -108,17 +104,25 @@ def main():
 
     logger.info("Инициализация браузера...")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        # Эмулируем реальный браузер
+        # Флаги для предотвращения зависаний (OOM) внутри Docker-контейнера
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--mute-audio"
+            ]
+        )
         context = browser.new_context(
             viewport={'width': 1280, 'height': 720},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         )
         page = context.new_page()
 
-        # Проходим по строкам (пропуская заголовок)
         for i, row in enumerate(data[1:], start=2):
-            # Проверка, не заполнена ли уже категория
             current_category = row[cat_idx] if len(row) > cat_idx else ""
             map_url = row[map_idx] if len(row) > map_idx else ""
 
@@ -127,15 +131,15 @@ def main():
                 
                 category_result = scrape_category(page, map_url)
                 
-                # Мгновенное обновление ячейки (индексы в gspread с 1)
+                # Мгновенное обновление ячейки
                 sheet.update_cell(i, cat_idx + 1, category_result)
                 logger.info(f"Результат: {category_result}")
 
-                # Анти-фрод задержка
+                # Случайная задержка для имитации действий человека
                 wait_time = random.randint(3, 6)
                 time.sleep(wait_time)
             else:
-                logger.info(f"Строка {i} пропущена (уже заполнена или нет ссылки)")
+                pass # Пропускаем заполненные или пустые строки без лишнего спама в логи
 
         browser.close()
     logger.info("Работа завершена!")
